@@ -83,8 +83,8 @@ def call_mcp_tool(tool: str, args: Dict):
     server.stdin.write(json.dumps(req) + "\n")
     server.stdin.flush()
 
-    # ✅ Read until we get a response matching OUR request ID
-    for _ in range(100):
+    # ✅ Read until we get a response matching OUR request
+    for _ in range(100):   
         line = server.stdout.readline().strip()
         if not line:
             continue
