@@ -101,7 +101,7 @@ def web_search(input: WebSearchInput):
     except Exception as e:
         return {"error": f"Web Search error: {str(e)}"}
 
-# Server Entry Point
+# Server Entry Pointt
 if __name__ == "__main__":
     print("Starting MCP server", flush=True, file=sys.stderr)
     mcp.run()
