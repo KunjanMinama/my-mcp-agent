@@ -4,6 +4,7 @@ from typing import TypedDict, Any, Dict
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from dotenv import load_dotenv 
 import os 
+import re
 
 load_dotenv()
 
@@ -44,57 +45,76 @@ time.sleep(1)
 # MCP Communication Helpers
 # We define functions to send requests and notifications over the MCP JSON-RPC protocol:
 request_id = 0
+
 def send_request(method: str, params: Dict = None):
     global request_id
-    
     request_id += 1
-    req = {"jsonrpc": "2.0", "id": str(request_id), "method": method}
-    if params:
-        req["params"] = params
-    server.stdin.write(json.dumps(req) + "\n")
-    server.stdin.flush()
-    return server.stdout.readline().strip()
-
-def send_notification(method: str, params:Dict = None):
-    req = {"jsonrpc": "2.0", "method": method}
+    current_id = str(request_id)
+    req = {"jsonrpc": "2.0", "id": current_id, "method": method}
     if params:
         req["params"] = params
     server.stdin.write(json.dumps(req) + "\n")
     server.stdin.flush()
 
+    # ✅ Read until we get a response matching OUR request ID
+    for _ in range(100):
+        line = server.stdout.readline().strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            if str(data.get("id")) == current_id:
+                return data.get("result")
+        except Exception:
+            continue  # skip non-JSON lines like "Starting MCP server"
+    return None
 
-# Initialize the MCP Connection
-
-init_response = send_request("initialize", {
-    "protocolVersion": "2024-11-05",
-    "capabilities": {},
-    "clientInfo": {"name": "mcp-client", "version": "1.0.0"}
-})
-send_notification("initialized")
-
-## Calling MCP tools
-#This function allows the agent to call any tool registered in the MCP server with parameters.
 
 def call_mcp_tool(tool: str, args: Dict):
     global request_id
     request_id += 1
+    current_id = str(request_id)
     req = {
         "jsonrpc": "2.0",
-        "id": str(request_id),
+        "id": current_id,
         "method": "tools/call",
         "params": {"name": tool, "arguments": {"input": args}},
     }
     server.stdin.write(json.dumps(req) + "\n")
     server.stdin.flush()
-    response = server.stdout.readline().strip()
-    if not response:
-        return "NO response from MCP server"
-    try:
-        resp_data = json.loads(response)
-        return resp_data.get("result") or f"Error: {resp_data.get('error')}"
-    except:
-        return response
-    
+
+    # ✅ Read until we get a response matching OUR request ID
+    for _ in range(100):
+        line = server.stdout.readline().strip()
+        if not line:
+            continue
+        print(f"🔎 RAW LINE: {line!r}") 
+        try:
+            data = json.loads(line)
+            if str(data.get("id")) != current_id:
+                continue  # skip responses meant for other requests
+
+            result = data.get("result", {})
+
+            # ✅ Unwrap MCP content envelope: {"content": [{"type": "text", "text": "..."}]}
+            if isinstance(result, dict) and "content" in result:
+                for block in result["content"]:
+                    if block.get("type") == "text":
+                        try:
+                            inner = json.loads(block["text"])
+                            # ✅ Unwrap {"ok": True, "content": {...}}
+                            if isinstance(inner, dict) and inner.get("ok") and "content" in inner:
+                                return inner["content"]
+                            return inner
+                        except Exception:
+                            return block["text"]
+            return result
+
+        except Exception:
+            continue  # skip non-JSON lines
+
+    print(f"⚠️ call_mcp_tool timed out for {tool}")
+    return None
 ## Agent State Graph
 
 class S(TypedDict):
@@ -107,33 +127,38 @@ class S(TypedDict):
 # 1. Routing Requests to Tools
 #----------------AGENT LOGIC-------------------------------------------
 def route_request(state: S):
-    """Use LLM to determine which tool to use and extract parameters"""
-
     routing_prompt = f"""
-You MUST respond in valid JSON only.
+You MUST respond in JSON ONLY. No markdown, no backticks, no explanation.
 
 User request: {state["msg"]}
 
-Available tools:
-- get_weather (needs: city)
-- web_search (needs: query)
+Rules:
+- If user asks about weather → 
+  {{"tool": "get_weather", "parameters": {{"city": "<city name>"}}}}
 
-Return ONLY this format:
-{{
-  "tool": "get_weather" | "web_search" | "none",
-  "parameters": {{...}} or null
-}}
+- If user asks to search/google/find news →
+  {{"tool": "web_search", "parameters": {{"query": "<search query>"}}}}
 
-Only use tools if clarity needed, For general conversation, use "none"."""
-    
+- Otherwise →
+  {{"tool": "none", "parameters": null}}
+
+Return ONLY a raw JSON object. No ```json blocks. No extra text.
+"""
+
     response = client.invoke(routing_prompt)
-# The agent use LLM to decide which tool is appropriate.
+
     try:
-        routing_decision = json.loads(response.content)
+        # ✅ Strip markdown code fences before parsing
+        raw = response.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        raw = raw.strip()
+
+        routing_decision = json.loads(raw)
         tool = routing_decision.get("tool")
         params = routing_decision.get("parameters")
 
-        print(f"🤖 Routing decision: {routing_decision.get('reasoning')}")
+        print(f"🤖 Routing decision: {routing_decision}")
 
         if tool == "get_weather" and params:
             result = call_mcp_tool("get_weather", params)
@@ -142,19 +167,21 @@ Only use tools if clarity needed, For general conversation, use "none"."""
         elif tool == "web_search" and params:
             result = call_mcp_tool("web_search", params)
             return {"msg": state["msg"], "tool_result": result, "result": ""}
-        
+
         else:
-            return {"msg": state["msg"], "tool_result": None}
-        
+            return {"msg": state["msg"], "tool_result": None, "result": ""}
+
     except Exception as e:
         print(f"⚠️ Routing error: {e}")
-        return {"msg": state["msg"], "tool_result": None}
+        print(f"⚠️ Raw LLM response was: {response.content!r}")  # helpful for debugging
+        return {"msg": state["msg"], "tool_result": None, "result": ""}
     
 # If no tool is needed, the agent continues with general conversation.
 
 ## 2. General Natural Language Responses
 
 def generate_response(state: S):
+    print(f"🔍 tool_result received: {state.get('tool_result')}")
     """Use LLM to generate a natural language response"""
     if state.get("tool_result") is None:
         # No tool was used, direct LLM response

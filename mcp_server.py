@@ -1,9 +1,13 @@
+print("Starting MCP server", flush=True, file=sys.stderr) 
+
 from fastmcp import FastMCP
 from pydantic import BaseModel
 import os
 import requests
 from dotenv import load_dotenv
+import sys
 
+load_dotenv()
 ## API Configuration
 
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
@@ -11,6 +15,14 @@ SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 ## Creating the MCP Server
 
 mcp = FastMCP("multi-tool-server")
+
+## INput Models
+
+class WeatherInput(BaseModel):
+    city: str
+
+class WebSearchInput(BaseModel):
+    query: str 
 
 ## Weather TOOL
 
@@ -39,7 +51,7 @@ def get_weather(input: WeatherInput):
                 "feels_like": f"{current['FeelsLikeC']}°C"
             
             }
-            return weather_info
+            return {"ok": True, "content": weather_info}
         else:
             return {"error": f"Could not fetch weather for {input.city}"}
         
@@ -68,32 +80,28 @@ def web_search(input: WebSearchInput):
 
         if response.status_code == 200:
             data = response.json()
-            results = []
-
-            # Extract organic results
-            for item in data.get("organic", [])[:5]:
-                results.append({
+            results = [
+                {
                     "title": item.get("title"),
                     "link": item.get("link"),
                     "snippet": item.get("snippet")
-                })
+                }
+                for item in data.get("organic", [])[:5]
+            ]
 
-            # Include knowledge graph if available
-            knowledge = data.get("knowledgeGraph", {})
-
-            return {
+            return {"ok": True, "content": {
                 "query": input.query,
                 "results": results,
-                "knowledge_grpah": knowledge.get("description", "") if knowledge else None
-            }
+                "knowledge_graph": data.get("knowledgeGraph", {})
+            }}
+
         else:
-            return {"error": f"Server API error: {response.status_code}"}
-        
+            return {"error": f"Serper API error: {response.status_code}"}
+
     except Exception as e:
-        return {"error": f"Web Search error: {str (e)}"}
-    
+        return {"error": f"Web Search error: {str(e)}"}
 
 # Server Entry Point
 if __name__ == "__main__":
-    print("🔥 MCP server is running..")
+    print("Starting MCP server", flush=True, file=sys.stderr)
     mcp.run()
